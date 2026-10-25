@@ -461,25 +461,37 @@ class ConverterApp:
             return "#ffffff", "#dbe4f0"
         return "#111827", "#475569"
 
+    def _mix_color(self, base: str, tint: str, amount: float) -> str:
+        """把 tint 混進 base（amount 0–1），用來模擬半透明的玻璃效果。"""
+        try:
+            br, bg, bb = (c // 257 for c in self.root.winfo_rgb(base))
+            tr, tg, tb = (c // 257 for c in self.root.winfo_rgb(tint))
+        except tk.TclError:
+            return base
+        amount = max(0.0, min(1.0, amount))
+        r = round(br + (tr - br) * amount)
+        g = round(bg + (tg - bg) * amount)
+        b = round(bb + (tb - bb) * amount)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
     def _card_color(self) -> str:
-        """讓卡片色調跟背景一致：純色用淡色版，圖片用圖片的平均色。"""
+        """讓卡片色調跟背景一致：純色或圖片都用淡色版，帶出一點透明感。"""
         if self.bg_mode == "color":
-            r, g, b = self.root.winfo_rgb(self.bg_color)
-            r, g, b = r // 257, g // 257, b // 257
-            mixed = [round(c + (255 - c) * 0.86) for c in (r, g, b)]
-            return "#%02x%02x%02x" % tuple(mixed)
+            return self._mix_color("#ffffff", self.bg_color, 0.26)
         if self.bg_mode == "image":
             source = self._load_bg_source()
             if source is not None:
                 r, g, b = source.resize(
                     (1, 1), Image.Resampling.LANCZOS
                 ).getpixel((0, 0))
-                mixed = [round(c + (255 - c) * 0.93) for c in (r, g, b)]
-                return "#%02x%02x%02x" % tuple(mixed)
+                return self._mix_color("#ffffff", f"#{r:02x}{g:02x}{b:02x}", 0.26)
         return CARD_BG
 
     def _apply_card_theme(self, color: str) -> None:
         self.card.configure(bg=color)
+        # 白色欄位也混一點背景色，避免整片死白
+        field = self._mix_color(color, "#ffffff", 0.55)
+        self.field_bg = field
         style = ttk.Style(self.root)
         for name in (
             "TFrame",
@@ -490,6 +502,48 @@ class ConverterApp:
             "TLabelframe.Label",
         ):
             style.configure(name, background=color)
+        style.configure(
+            "TEntry", fieldbackground=field, foreground="#1f2937", insertcolor="#1f2937"
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=field,
+            background=color,
+            foreground="#1f2937",
+            arrowcolor="#475569",
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", field)],
+            selectbackground=[("readonly", field)],
+            selectforeground=[("readonly", "#1f2937")],
+        )
+        style.configure(
+            "TSpinbox",
+            fieldbackground=field,
+            background=color,
+            foreground="#1f2937",
+            arrowcolor="#475569",
+        )
+        style.configure("TScale", background=color)
+
+        if hasattr(self, "listbox"):
+            self.listbox.configure(
+                bg=field,
+                fg="#1f2937",
+                selectbackground=ACCENT,
+                selectforeground="white",
+            )
+        if hasattr(self, "log_text"):
+            self.log_text.configure(bg=field, fg="#1f2937")
+        if hasattr(self, "drop_zone"):
+            self.drop_zone.configure(bg=field)
+
+        # 下拉選單是獨立的 listbox，也要跟著換色
+        self.root.option_add("*TCombobox*Listbox.background", field)
+        self.root.option_add("*TCombobox*Listbox.foreground", "#1f2937")
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
 
     def _load_bg_source(self) -> Image.Image | None:
         if not self.bg_image:
@@ -775,14 +829,14 @@ class ConverterApp:
 
     # ------------------------------------------------------------ 檔案清單 --
     def _on_drop(self, event) -> None:
-        self.drop_zone.configure(bg="white", fg="#5b6472")
+        self.drop_zone.configure(bg=self.field_bg, fg="#5b6472")
         self._add_paths([Path(p) for p in _parse_dnd_paths(str(event.data))])
 
     def _on_drag_enter(self, _event) -> None:
         self.drop_zone.configure(bg="#e8f0fe", fg=ACCENT)
 
     def _on_drag_leave(self, _event) -> None:
-        self.drop_zone.configure(bg="white", fg="#5b6472")
+        self.drop_zone.configure(bg=self.field_bg, fg="#5b6472")
 
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
