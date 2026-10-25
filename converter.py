@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     "background_color": DEFAULT_BG_COLOR,
     "background_image": "",
     "background_dim": 35,           # 0-70，圖片變暗程度
+    "surface_tint": 35,             # 0-60，白色區塊透出背景色的程度
 }
 
 
@@ -76,6 +77,10 @@ def load_settings() -> dict:
         data["background_dim"] = max(0, min(70, int(data["background_dim"])))
     except (TypeError, ValueError):
         data["background_dim"] = DEFAULT_SETTINGS["background_dim"]
+    try:
+        data["surface_tint"] = max(0, min(60, int(data["surface_tint"])))
+    except (TypeError, ValueError):
+        data["surface_tint"] = DEFAULT_SETTINGS["surface_tint"]
 
     if data["background_mode"] == "image" and not Path(data["background_image"]).is_file():
         data["background_mode"] = "default"
@@ -123,6 +128,20 @@ def _parse_dnd_paths(data: str) -> list[str]:
     return [item for item in items if item.strip()]
 
 
+IMAGE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp",
+    ".tif", ".tiff", ".gif", ".ico",
+}
+
+
+def _first_image_path(data: str) -> str | None:
+    """從拖放資料中挑出第一個圖片檔（忽略非圖片）。"""
+    for item in _parse_dnd_paths(data):
+        if Path(item).suffix.lower() in IMAGE_EXTS:
+            return item
+    return None
+
+
 class ConverterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -135,6 +154,7 @@ class ConverterApp:
         self.bg_color: str = settings["background_color"]
         self.bg_image: str = settings["background_image"]
         self.bg_dim: int = settings["background_dim"]
+        self.surface_tint: int = settings["surface_tint"]
         self._bg_source: Image.Image | None = None
         self._bg_source_path: str = ""
         self._bg_photo: ImageTk.PhotoImage | None = None
@@ -475,22 +495,27 @@ class ConverterApp:
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def _card_color(self) -> str:
-        """讓卡片色調跟背景一致：純色或圖片都用淡色版，帶出一點透明感。"""
+        """讓卡片色調跟背景一致：純色或圖片都混入背景色，做出透明感。"""
+        amount = self.surface_tint / 100
+        if amount <= 0:
+            return CARD_BG
         if self.bg_mode == "color":
-            return self._mix_color("#ffffff", self.bg_color, 0.26)
+            return self._mix_color("#ffffff", self.bg_color, amount)
         if self.bg_mode == "image":
             source = self._load_bg_source()
             if source is not None:
                 r, g, b = source.resize(
                     (1, 1), Image.Resampling.LANCZOS
                 ).getpixel((0, 0))
-                return self._mix_color("#ffffff", f"#{r:02x}{g:02x}{b:02x}", 0.26)
-        return CARD_BG
+                return self._mix_color(
+                    "#ffffff", f"#{r:02x}{g:02x}{b:02x}", amount
+                )
+        return self._mix_color("#ffffff", BG, amount)
 
     def _apply_card_theme(self, color: str) -> None:
         self.card.configure(bg=color)
         # 白色欄位也混一點背景色，避免整片死白
-        field = self._mix_color(color, "#ffffff", 0.55)
+        field = self._mix_color(color, "#ffffff", 0.5)
         self.field_bg = field
         style = ttk.Style(self.root)
         for name in (
@@ -629,6 +654,7 @@ class ConverterApp:
         color: str | None = None,
         image: str | None = None,
         dim: int | None = None,
+        tint: int | None = None,
     ) -> None:
         if mode not in ("default", "color", "image"):
             mode = "default"
@@ -638,6 +664,8 @@ class ConverterApp:
             self.bg_image = str(image)
         if dim is not None:
             self.bg_dim = max(0, min(70, int(dim)))
+        if tint is not None:
+            self.surface_tint = max(0, min(60, int(tint)))
         if mode == "image" and not Path(self.bg_image).is_file():
             mode = "default"
 
@@ -655,6 +683,7 @@ class ConverterApp:
                 "background_color": self.bg_color,
                 "background_image": self.bg_image,
                 "background_dim": self.bg_dim,
+                "surface_tint": self.surface_tint,
             }
         )
 
@@ -686,6 +715,7 @@ class ConverterApp:
         color_var = tk.StringVar(value=self.bg_color)
         image_var = tk.StringVar(value=self.bg_image)
         dim_var = tk.IntVar(value=self.bg_dim)
+        tint_var = tk.IntVar(value=self.surface_tint)
 
         kind = ttk.LabelFrame(body, text="背景類型", padding=8)
         kind.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -761,12 +791,27 @@ class ConverterApp:
             command=lambda _v: dim_label.configure(text=f"{int(dim_var.get())}%")
         )
 
+        ttk.Label(body, text="介面透出").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        tint_row = ttk.Frame(body)
+        tint_row.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        tint_scale = ttk.Scale(
+            tint_row, from_=0, to=60, variable=tint_var, length=210
+        )
+        tint_scale.pack(side="left")
+        tint_label = ttk.Label(tint_row, text=f"{self.surface_tint}%", width=5)
+        tint_label.pack(side="left", padx=(8, 0))
+        tint_scale.configure(
+            command=lambda _v: tint_label.configure(text=f"{int(tint_var.get())}%")
+        )
+
         ttk.Label(
             body,
-            text="圖片會自動裁切填滿視窗；調高變暗可讓文字更清楚。",
+            text="圖片可直接拖進這個視窗；介面透出越高，白色區塊越能透出背景色。",
             font=FONT_SMALL,
             foreground="#7a8494",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         def sync() -> None:
             mode = mode_var.get()
@@ -798,11 +843,17 @@ class ConverterApp:
                         "背景設定", "這個檔案不是可讀取的圖片。", parent=dlg
                     )
                     return
-            self.apply_background(mode, color_var.get(), path, int(dim_var.get()))
+            self.apply_background(
+                mode,
+                color_var.get(),
+                path,
+                int(dim_var.get()),
+                int(tint_var.get()),
+            )
             dlg.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="取消", command=dlg.destroy).pack(side="right")
         tk.Button(
             buttons,
@@ -819,6 +870,31 @@ class ConverterApp:
             cursor="hand2",
             highlightthickness=0,
         ).pack(side="right", padx=(0, 8))
+
+        if HAS_DND:
+            def handle_drop(event) -> None:
+                path = _first_image_path(str(event.data))
+                if not path:
+                    messagebox.showwarning(
+                        "背景設定",
+                        "請拖入圖片檔（PNG、JPG、WEBP、BMP…）。",
+                        parent=dlg,
+                    )
+                    return
+                image_var.set(path)
+                mode_var.set("image")
+                sync()
+
+            def register_drop(widget) -> None:
+                try:
+                    widget.drop_target_register(DND_FILES)
+                    widget.dnd_bind("<<Drop>>", handle_drop)
+                except tk.TclError:
+                    pass
+                for child in widget.winfo_children():
+                    register_drop(child)
+
+            register_drop(dlg)
 
         sync()
         dlg.update_idletasks()
