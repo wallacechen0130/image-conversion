@@ -5,13 +5,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
 import threading
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 import tkinter as tk
+
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -27,8 +30,66 @@ import convert_core as core
 APP_TITLE = "檔案轉檔工具"
 FONT = ("Microsoft JhengHei UI", 10)
 FONT_SMALL = ("Microsoft JhengHei UI", 9)
-BG = "#f2f4f7"
+BG = "#eef2f7"
+CARD_BG = "#f7f9fc"
 ACCENT = "#2563eb"
+HERO_H = 92
+DEFAULT_BG_COLOR = "#dbeafe"
+
+CONFIG_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ImageConverter"
+CONFIG_FILE = CONFIG_DIR / "settings.json"
+DEFAULT_SETTINGS = {
+    "background_mode": "default",   # default | color | image
+    "background_color": DEFAULT_BG_COLOR,
+    "background_image": "",
+    "background_dim": 35,           # 0-70，圖片變暗程度
+}
+
+
+def _is_hex_color(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 7
+        and value.startswith("#")
+        and all(c in "0123456789abcdefABCDEF" for c in value[1:])
+    )
+
+
+def load_settings() -> dict:
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, dict):
+            for key in DEFAULT_SETTINGS:
+                if key in raw:
+                    data[key] = raw[key]
+    except (OSError, ValueError):
+        pass
+
+    if data["background_mode"] not in ("default", "color", "image"):
+        data["background_mode"] = "default"
+    if not _is_hex_color(data["background_color"]):
+        data["background_color"] = DEFAULT_BG_COLOR
+    if not isinstance(data["background_image"], str):
+        data["background_image"] = ""
+    try:
+        data["background_dim"] = max(0, min(70, int(data["background_dim"])))
+    except (TypeError, ValueError):
+        data["background_dim"] = DEFAULT_SETTINGS["background_dim"]
+
+    if data["background_mode"] == "image" and not Path(data["background_image"]).is_file():
+        data["background_mode"] = "default"
+    return data
+
+
+def save_settings(data: dict) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def _resource_path(relative: str) -> Path:
@@ -69,11 +130,23 @@ class ConverterApp:
         self.events: queue.Queue = queue.Queue()
         self.busy = False
 
+        settings = load_settings()
+        self.bg_mode: str = settings["background_mode"]
+        self.bg_color: str = settings["background_color"]
+        self.bg_image: str = settings["background_image"]
+        self.bg_dim: int = settings["background_dim"]
+        self._bg_source: Image.Image | None = None
+        self._bg_source_path: str = ""
+        self._bg_photo: ImageTk.PhotoImage | None = None
+        self._bg_job: str | None = None
+        self._poll_job: str | None = None
+        self._bg_dialog: tk.Toplevel | None = None
+
         root.title(APP_TITLE)
-        root.geometry("840x820")
-        root.minsize(700, 600)
+        root.minsize(720, 640)
         root.configure(bg=BG)
         root.option_add("*Font", FONT)
+        self._center_window(860, 860)
 
         icon = _resource_path("assets/icon.ico")
         if icon.exists():
@@ -83,9 +156,37 @@ class ConverterApp:
                 pass
 
         self._build_ui()
+        self._apply_card_theme(self._card_color())
         self._refresh_targets()
         self._set_status("把檔案拖進來，或按「選擇檔案」")
-        self.root.after(100, self._poll_events)
+        self._poll_job = self.root.after(100, self._poll_events)
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(80, self._render_background)
+
+    def _center_window(self, width: int, height: int) -> None:
+        """把視窗放在 Windows 工作區中央，避免底部被工作列遮住。"""
+        left, top = 0, 0
+        area_w, area_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            # SPI_GETWORKAREA：不含工作列的可用桌面範圍
+            if ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(rect), 0
+            ):
+                left, top = rect.left, rect.top
+                area_w, area_h = rect.right - rect.left, rect.bottom - rect.top
+        except Exception:  # noqa: BLE001 - 非 Windows 或查詢失敗時用螢幕尺寸
+            pass
+
+        width = min(width, max(640, area_w - 24))
+        height = min(height, max(560, area_h - 24))
+        x = left + max(0, (area_w - width) // 2)
+        y = top + max(0, (area_h - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self) -> None:
@@ -94,30 +195,55 @@ class ConverterApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG)
-        style.configure("TCheckbutton", background=BG)
-        style.configure("TRadiobutton", background=BG)
-        style.configure("TLabelframe", background=BG)
-        style.configure("TLabelframe.Label", background=BG, font=FONT)
+        style.configure("TFrame", background=CARD_BG)
+        style.configure("TLabel", background=CARD_BG)
+        style.configure("TCheckbutton", background=CARD_BG)
+        style.configure("TRadiobutton", background=CARD_BG)
+        style.configure("TLabelframe", background=CARD_BG)
+        style.configure("TLabelframe.Label", background=CARD_BG, font=FONT)
         style.configure("Accent.TButton", font=("Microsoft JhengHei UI", 11, "bold"))
 
-        outer = ttk.Frame(self.root, padding=16)
+        # 背景畫布（顏色或圖片）＋ 浮在上面的內容卡片
+        self.bg_canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, bg=BG)
+        self.bg_canvas.pack(fill="both", expand=True)
+
+        self.card = tk.Frame(
+            self.root,
+            bg=CARD_BG,
+            highlightbackground="#d8dfe9",
+            highlightthickness=1,
+        )
+        self.card.place(
+            x=24,
+            y=HERO_H,
+            relwidth=1,
+            width=-48,
+            relheight=1,
+            height=-(HERO_H + 20),
+        )
+
+        self.bg_btn = tk.Button(
+            self.bg_canvas,
+            text="背景設定",
+            command=self.open_bg_dialog,
+            font=FONT_SMALL,
+            bg="white",
+            fg="#1f2937",
+            activebackground="#eef2f7",
+            activeforeground="#1f2937",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=5,
+            cursor="hand2",
+            highlightthickness=0,
+        )
+
+        outer = ttk.Frame(self.card, padding=14)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(4, weight=3)  # 檔案清單
-        outer.rowconfigure(8, weight=2)  # 訊息
-
-        # 標題
-        ttk.Label(
-            outer, text="檔案轉檔工具", font=("Microsoft JhengHei UI", 16, "bold")
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            outer,
-            text="支援 PDF、PNG、JPG、WEBP、BMP、TIFF、GIF、ICO",
-            font=FONT_SMALL,
-            foreground="#5b6472",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 12))
+        outer.rowconfigure(2, weight=3)  # 檔案清單
+        outer.rowconfigure(6, weight=2)  # 訊息
 
         # 拖放區
         self.drop_zone = tk.Label(
@@ -128,10 +254,10 @@ class ConverterApp:
             fg="#5b6472",
             bd=2,
             relief="ridge",
-            height=4,
+            height=3,
             cursor="hand2",
         )
-        self.drop_zone.grid(row=2, column=0, sticky="ew")
+        self.drop_zone.grid(row=0, column=0, sticky="ew")
         self.drop_zone.bind("<Button-1>", lambda _e: self.add_files())
 
         hint = (
@@ -140,12 +266,12 @@ class ConverterApp:
             else "未安裝 tkinterdnd2，無法拖放；請使用「選擇檔案」按鈕"
         )
         ttk.Label(outer, text=hint, font=FONT_SMALL, foreground="#7a8494").grid(
-            row=3, column=0, sticky="w", pady=(6, 10)
+            row=1, column=0, sticky="w", pady=(6, 10)
         )
 
         # 檔案清單
         list_frame = ttk.LabelFrame(outer, text="待轉換檔案", padding=8)
-        list_frame.grid(row=4, column=0, sticky="nsew")
+        list_frame.grid(row=2, column=0, sticky="nsew")
 
         self.listbox = tk.Listbox(
             list_frame,
@@ -182,7 +308,7 @@ class ConverterApp:
 
         # 轉檔設定
         options = ttk.LabelFrame(outer, text="轉檔設定", padding=10)
-        options.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        options.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         options.columnconfigure(3, weight=1)
 
         ttk.Label(options, text="輸出格式").grid(row=0, column=0, sticky="w")
@@ -231,7 +357,7 @@ class ConverterApp:
 
         # 輸出位置
         out_frame = ttk.LabelFrame(outer, text="輸出位置", padding=10)
-        out_frame.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        out_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         out_frame.columnconfigure(1, weight=1)
 
         self.out_mode = tk.StringVar(value="source")
@@ -259,7 +385,7 @@ class ConverterApp:
 
         # 開始轉檔
         action = ttk.Frame(outer)
-        action.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        action.grid(row=5, column=0, sticky="ew", pady=(14, 0))
         action.columnconfigure(1, weight=1)
 
         self.convert_btn = tk.Button(
@@ -291,7 +417,7 @@ class ConverterApp:
 
         # 訊息
         log_frame = ttk.LabelFrame(outer, text="訊息", padding=8)
-        log_frame.grid(row=8, column=0, sticky="nsew", pady=(12, 0))
+        log_frame.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
         self.log_text = tk.Text(
             log_frame,
             height=5,
@@ -315,6 +441,337 @@ class ConverterApp:
                 widget.dnd_bind("<<Drop>>", self._on_drop)
                 widget.dnd_bind("<<DropEnter>>", self._on_drag_enter)
                 widget.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+
+    # ------------------------------------------------------------ 背景設定 --
+    def _on_root_configure(self, event) -> None:
+        if event.widget is not self.root:
+            return
+        if self._bg_job is not None:
+            try:
+                self.root.after_cancel(self._bg_job)
+            except tk.TclError:
+                pass
+        self._bg_job = self.root.after(160, self._render_background)
+
+    def _readable_colors(self, color: str) -> tuple[str, str]:
+        r, g, b = self.root.winfo_rgb(color)
+        r, g, b = r // 257, g // 257, b // 257
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        if luminance < 140:
+            return "#ffffff", "#dbe4f0"
+        return "#111827", "#475569"
+
+    def _card_color(self) -> str:
+        """讓卡片色調跟背景一致：純色用淡色版，圖片用圖片的平均色。"""
+        if self.bg_mode == "color":
+            r, g, b = self.root.winfo_rgb(self.bg_color)
+            r, g, b = r // 257, g // 257, b // 257
+            mixed = [round(c + (255 - c) * 0.86) for c in (r, g, b)]
+            return "#%02x%02x%02x" % tuple(mixed)
+        if self.bg_mode == "image":
+            source = self._load_bg_source()
+            if source is not None:
+                r, g, b = source.resize(
+                    (1, 1), Image.Resampling.LANCZOS
+                ).getpixel((0, 0))
+                mixed = [round(c + (255 - c) * 0.93) for c in (r, g, b)]
+                return "#%02x%02x%02x" % tuple(mixed)
+        return CARD_BG
+
+    def _apply_card_theme(self, color: str) -> None:
+        self.card.configure(bg=color)
+        style = ttk.Style(self.root)
+        for name in (
+            "TFrame",
+            "TLabel",
+            "TCheckbutton",
+            "TRadiobutton",
+            "TLabelframe",
+            "TLabelframe.Label",
+        ):
+            style.configure(name, background=color)
+
+    def _load_bg_source(self) -> Image.Image | None:
+        if not self.bg_image:
+            return None
+        if self._bg_source is not None and self._bg_source_path == self.bg_image:
+            return self._bg_source
+        try:
+            with Image.open(self.bg_image) as im:
+                source = ImageOps.exif_transpose(im).convert("RGB")
+                source.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+                self._bg_source = source.copy()
+            self._bg_source_path = self.bg_image
+            return self._bg_source
+        except Exception:  # noqa: BLE001
+            self._bg_source = None
+            self._bg_source_path = ""
+            return None
+
+    def _render_background(self) -> None:
+        self._bg_job = None
+        canvas = getattr(self, "bg_canvas", None)
+        if canvas is None:
+            return
+        w = max(canvas.winfo_width(), 1)
+        h = max(canvas.winfo_height(), 1)
+        if w <= 1 or h <= 1:
+            return
+
+        canvas.delete("all")
+        title_fg, subtitle_fg = "#111827", "#5b6472"
+        shadow = False
+
+        if self.bg_mode == "image":
+            source = self._load_bg_source()
+            if source is None:
+                self.bg_mode = "default"
+                self._apply_card_theme(self._card_color())
+                self._render_background()
+                return
+            img = ImageOps.fit(
+                source, (w, h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.4)
+            )
+            if self.bg_dim:
+                img = Image.blend(
+                    img, Image.new("RGB", (w, h), (0, 0, 0)), self.bg_dim / 100
+                )
+            # 頂部漸層遮罩，讓標題在花俏的圖片上仍然清楚
+            mask = Image.new("L", (1, h), 0)
+            fade = max(1, min(HERO_H + 60, h))
+            for y in range(fade):
+                mask.putpixel((0, y), int(150 * (1 - y / fade)))
+            mask = mask.resize((w, h))
+            img = Image.composite(Image.new("RGB", (w, h), (0, 0, 0)), img, mask)
+            self._bg_photo = ImageTk.PhotoImage(img)
+            canvas.create_image(0, 0, anchor="nw", image=self._bg_photo)
+            title_fg, subtitle_fg = "#ffffff", "#e2e8f0"
+            shadow = True
+        elif self.bg_mode == "color":
+            canvas.create_rectangle(0, 0, w, h, fill=self.bg_color, outline="")
+            title_fg, subtitle_fg = self._readable_colors(self.bg_color)
+        else:
+            canvas.create_rectangle(0, 0, w, h, fill=BG, outline="")
+
+        if shadow:
+            canvas.create_text(
+                25, 19, anchor="nw", text=APP_TITLE,
+                font=("Microsoft JhengHei UI", 18, "bold"), fill="#0b1220",
+            )
+        canvas.create_text(
+            24, 18, anchor="nw", text=APP_TITLE,
+            font=("Microsoft JhengHei UI", 18, "bold"), fill=title_fg,
+        )
+        canvas.create_text(
+            24, 54, anchor="nw",
+            text="支援 PDF、PNG、JPG、WEBP、BMP、TIFF、GIF、ICO",
+            font=FONT_SMALL, fill=subtitle_fg,
+        )
+        canvas.create_window(w - 20, 22, anchor="ne", window=self.bg_btn)
+
+    def apply_background(
+        self,
+        mode: str,
+        color: str | None = None,
+        image: str | None = None,
+        dim: int | None = None,
+    ) -> None:
+        if mode not in ("default", "color", "image"):
+            mode = "default"
+        if color and _is_hex_color(color):
+            self.bg_color = color
+        if image is not None:
+            self.bg_image = str(image)
+        if dim is not None:
+            self.bg_dim = max(0, min(70, int(dim)))
+        if mode == "image" and not Path(self.bg_image).is_file():
+            mode = "default"
+
+        self.bg_mode = mode
+        self._bg_source = None
+        self._bg_source_path = ""
+        self._save_bg_settings()
+        self._apply_card_theme(self._card_color())
+        self._render_background()
+
+    def _save_bg_settings(self) -> None:
+        save_settings(
+            {
+                "background_mode": self.bg_mode,
+                "background_color": self.bg_color,
+                "background_image": self.bg_image,
+                "background_dim": self.bg_dim,
+            }
+        )
+
+    def open_bg_dialog(self) -> None:
+        if self._bg_dialog is not None and self._bg_dialog.winfo_exists():
+            self._bg_dialog.lift()
+            self._bg_dialog.focus_force()
+            return
+
+        dlg = tk.Toplevel(self.root)
+        self._bg_dialog = dlg
+        dlg.title("背景設定")
+        dlg.configure(bg=self.card.cget("bg"))
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        icon = _resource_path("assets/icon.ico")
+        if icon.exists():
+            try:
+                dlg.iconbitmap(default=str(icon))
+            except tk.TclError:
+                pass
+
+        body = ttk.Frame(dlg, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        mode_var = tk.StringVar(value=self.bg_mode)
+        color_var = tk.StringVar(value=self.bg_color)
+        image_var = tk.StringVar(value=self.bg_image)
+        dim_var = tk.IntVar(value=self.bg_dim)
+
+        kind = ttk.LabelFrame(body, text="背景類型", padding=8)
+        kind.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Radiobutton(
+            kind, text="預設（淺色）", value="default", variable=mode_var,
+            command=lambda: sync(),
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            kind, text="純色", value="color", variable=mode_var,
+            command=lambda: sync(),
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            kind, text="圖片", value="image", variable=mode_var,
+            command=lambda: sync(),
+        ).pack(anchor="w")
+
+        ttk.Label(body, text="顏色").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        color_row = ttk.Frame(body)
+        color_row.grid(row=1, column=1, sticky="ew", pady=(12, 0))
+        swatch = tk.Label(
+            color_row, width=4, bg=color_var.get(), relief="solid", bd=1
+        )
+        swatch.pack(side="left")
+
+        def choose_color() -> None:
+            _rgb, hex_color = colorchooser.askcolor(
+                color=color_var.get(), parent=dlg, title="選擇背景顏色"
+            )
+            if hex_color:
+                color_var.set(hex_color)
+                swatch.configure(bg=hex_color)
+                mode_var.set("color")
+                sync()
+
+        color_btn = ttk.Button(color_row, text="選擇顏色…", command=choose_color)
+        color_btn.pack(side="left", padx=(8, 0))
+
+        ttk.Label(body, text="圖片").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        image_row = ttk.Frame(body)
+        image_row.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        image_entry = ttk.Entry(
+            image_row, textvariable=image_var, width=40, font=FONT_SMALL
+        )
+        image_entry.pack(side="left", fill="x", expand=True)
+
+        def choose_image() -> None:
+            path = filedialog.askopenfilename(
+                parent=dlg,
+                title="選擇背景圖片",
+                filetypes=[
+                    ("圖片", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff *.gif"),
+                    ("所有檔案", "*.*"),
+                ],
+            )
+            if path:
+                image_var.set(path)
+                mode_var.set("image")
+                sync()
+
+        image_btn = ttk.Button(image_row, text="瀏覽…", command=choose_image)
+        image_btn.pack(side="left", padx=(8, 0))
+
+        ttk.Label(body, text="變暗").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        dim_row = ttk.Frame(body)
+        dim_row.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        dim_scale = ttk.Scale(
+            dim_row, from_=0, to=70, variable=dim_var, length=210
+        )
+        dim_scale.pack(side="left")
+        dim_label = ttk.Label(dim_row, text=f"{self.bg_dim}%", width=5)
+        dim_label.pack(side="left", padx=(8, 0))
+        dim_scale.configure(
+            command=lambda _v: dim_label.configure(text=f"{int(dim_var.get())}%")
+        )
+
+        ttk.Label(
+            body,
+            text="圖片會自動裁切填滿視窗；調高變暗可讓文字更清楚。",
+            font=FONT_SMALL,
+            foreground="#7a8494",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        def sync() -> None:
+            mode = mode_var.get()
+            color_btn.state(["!disabled"] if mode == "color" else ["disabled"])
+            swatch.configure(
+                bg=color_var.get() if mode == "color" else "#e5e7eb"
+            )
+            for widget in (image_entry, image_btn):
+                widget.state(["!disabled"] if mode == "image" else ["disabled"])
+            dim_scale.state(["!disabled"] if mode == "image" else ["disabled"])
+            dim_label.configure(
+                foreground="#111827" if mode == "image" else "#9aa3b2"
+            )
+
+        def apply() -> None:
+            mode = mode_var.get()
+            path = image_var.get().strip()
+            if mode == "image":
+                if not path or not Path(path).is_file():
+                    messagebox.showwarning(
+                        "背景設定", "請先選擇一張背景圖片。", parent=dlg
+                    )
+                    return
+                try:
+                    with Image.open(path) as im:
+                        im.verify()
+                except Exception:  # noqa: BLE001
+                    messagebox.showwarning(
+                        "背景設定", "這個檔案不是可讀取的圖片。", parent=dlg
+                    )
+                    return
+            self.apply_background(mode, color_var.get(), path, int(dim_var.get()))
+            dlg.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="取消", command=dlg.destroy).pack(side="right")
+        tk.Button(
+            buttons,
+            text="套用",
+            command=apply,
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            bg=ACCENT,
+            fg="white",
+            activebackground="#1d4ed8",
+            activeforeground="white",
+            relief="flat",
+            padx=18,
+            pady=4,
+            cursor="hand2",
+            highlightthickness=0,
+        ).pack(side="right", padx=(0, 8))
+
+        sync()
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + max(20, (self.root.winfo_height() - h) // 3)
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     # ------------------------------------------------------------ 檔案清單 --
     def _on_drop(self, event) -> None:
@@ -546,7 +1003,16 @@ class ConverterApp:
                     self._finish(event[1], event[2])
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_events)
+        self._poll_job = self.root.after(100, self._poll_events)
+
+    def _on_close(self) -> None:
+        for job in (self._poll_job, self._bg_job):
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self.root.destroy()
 
     def _finish(self, results: list[Path], error: str | None) -> None:
         self.busy = False
